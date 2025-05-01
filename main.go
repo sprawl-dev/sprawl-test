@@ -1,78 +1,146 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
+	"context"
+	"crypto/rand"
 	"flag"
 	"fmt"
-	"io/ioutil"
-	"log"
 	"os"
 
-	shell "github.com/ipfs/go-ipfs-api"
+	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/sprawl-dev/sprawl-test/flags"
+	"github.com/sprawl-dev/sprawl-test/mdns"
+
+	"github.com/multiformats/go-multiaddr"
 )
 
+func handleStream(stream network.Stream) {
+	fmt.Println("Got a new stream!")
+
+	// Create a buffer stream for non-blocking read and write.
+	rw := bufio.NewReadWriter(bufio.NewReader(stream), bufio.NewWriter(stream))
+
+	go readData(rw)
+	go writeData(rw)
+
+	// 'stream' will stay open until you close it (or the other side closes it).
+}
+
+func readData(rw *bufio.ReadWriter) {
+	for {
+		str, err := rw.ReadString('\n')
+		if err != nil {
+			fmt.Println("Error reading from buffer")
+			panic(err)
+		}
+
+		if str == "" {
+			return
+		}
+		if str != "\n" {
+			// Green console colour: 	\x1b[32m
+			// Reset console colour: 	\x1b[0m
+			fmt.Printf("\x1b[32m%s\x1b[0m> ", str)
+		}
+
+	}
+}
+
+func writeData(rw *bufio.ReadWriter) {
+	stdReader := bufio.NewReader(os.Stdin)
+
+	for {
+		fmt.Print("> ")
+		sendData, err := stdReader.ReadString('\n')
+		if err != nil {
+			fmt.Println("Error reading from stdin")
+			panic(err)
+		}
+
+		_, err = rw.WriteString(fmt.Sprintf("%s\n", sendData))
+		if err != nil {
+			fmt.Println("Error writing to buffer")
+			panic(err)
+		}
+		err = rw.Flush()
+		if err != nil {
+			fmt.Println("Error flushing buffer")
+			panic(err)
+		}
+	}
+}
+
 func main() {
-	// Command-line flags.
-	modePtr := flag.String("mode", "", "Mode: upload or download")
-	filePtr := flag.String("file", "", "For upload: path to the file; for download: destination path")
-	cidPtr := flag.String("cid", "", "For download: the CID of the file to retrieve")
-	ipfsAPI := flag.String("api", "localhost:5001", "IPFS API endpoint (default localhost:5001)")
+	help := flag.Bool("help", false, "Display Help")
+	cfg := flags.ParseFlags()
 
-	flag.Parse()
+	if *help {
+		fmt.Printf("Simple example for peer discovery using mDNS. mDNS is great when you have multiple peers in local LAN.")
+		fmt.Printf("Usage: \n   Run './chat-with-mdns'\nor Run './chat-with-mdns -host [host] -port [port] -rendezvous [string] -pid [proto ID]'\n")
 
-	// Create a new IPFS shell connecting to the specified API endpoint.
-	ipfsShell := shell.NewShell(*ipfsAPI)
+		os.Exit(0)
+	}
 
-	switch *modePtr {
-	case "upload":
-		if *filePtr == "" {
-			log.Fatalf("Upload mode requires -file=<path-to-file>")
+	fmt.Printf("[*] Listening on: %s with port: %d\n", cfg.ListenHost, cfg.ListenPort)
+
+	ctx := context.Background()
+	r := rand.Reader
+
+	// Creates a new RSA key pair for this host.
+	prvKey, _, err := crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, r)
+	if err != nil {
+		panic(err)
+	}
+
+	// 0.0.0.0 will listen on any interface device.
+	sourceMultiAddr, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/tcp/%d", cfg.ListenHost, cfg.ListenPort))
+
+	// libp2p.New constructs a new libp2p Host.
+	// Other options can be added here.
+	host, err := libp2p.New(
+		libp2p.ListenAddrs(sourceMultiAddr),
+		libp2p.Identity(prvKey),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	// Set a function as stream handler.
+	// This function is called when a peer initiates a connection and starts a stream with this peer.
+	host.SetStreamHandler(protocol.ID(cfg.ProtocolID), handleStream)
+
+	fmt.Printf("\n[*] Your Multiaddress Is: /ip4/%s/tcp/%v/p2p/%s\n", cfg.ListenHost, cfg.ListenPort, host.ID())
+
+	peerChan := mdns.InitMDNS(host, cfg.RendezvousString)
+	for { // allows multiple peers to join
+		peer := <-peerChan // will block until we discover a peer
+		if peer.ID > host.ID() {
+			// if other end peer id greater than us, don't connect to it, just wait for it to connect us
+			fmt.Println("Found peer:", peer, " id is greater than us, wait for it to connect to us")
+			continue
+		}
+		fmt.Println("Found peer:", peer, ", connecting")
+
+		if err := host.Connect(ctx, peer); err != nil {
+			fmt.Println("Connection failed:", err)
+			continue
 		}
 
-		// Read file into memory.
-		data, err := ioutil.ReadFile(*filePtr)
+		// open a stream, this stream will be handled by handleStream other end
+		stream, err := host.NewStream(ctx, peer.ID, protocol.ID(cfg.ProtocolID))
+
 		if err != nil {
-			log.Fatalf("Failed to read file: %v", err)
+			fmt.Println("Stream open failed", err)
+		} else {
+			rw := bufio.NewReadWriter(bufio.NewReader(stream), bufio.NewWriter(stream))
+
+			go writeData(rw)
+			go readData(rw)
+			fmt.Println("Connected to:", peer)
 		}
-
-		// Upload file to IPFS (IPFS automatically handles chunking).
-		cid, err := ipfsShell.Add(bytes.NewReader(data))
-		if err != nil {
-			log.Fatalf("Failed to upload to IPFS: %v", err)
-		}
-
-		fmt.Printf("File uploaded to IPFS with CID: %s\n", cid)
-
-	case "download":
-		if *cidPtr == "" {
-			log.Fatalf("Download mode requires -cid=<file-CID>")
-		}
-		if *filePtr == "" {
-			log.Fatalf("Download mode requires -file=<destination-path>")
-		}
-
-		// Retrieve file from IPFS using the CID.
-		reader, err := ipfsShell.Cat(*cidPtr)
-		if err != nil {
-			log.Fatalf("Failed to retrieve file from IPFS: %v", err)
-		}
-
-		data, err := ioutil.ReadAll(reader)
-		if err != nil {
-			log.Fatalf("Failed to read data from IPFS response: %v", err)
-		}
-
-		// Save the retrieved data to a local file.
-		err = ioutil.WriteFile(*filePtr, data, 0644)
-		if err != nil {
-			log.Fatalf("Failed to write file: %v", err)
-		}
-
-		fmt.Printf("File downloaded from IPFS and saved as: %s\n", *filePtr)
-
-	default:
-		fmt.Println("Invalid mode. Use -mode=upload or -mode=download")
-		flag.Usage()
-		os.Exit(1)
 	}
 }
